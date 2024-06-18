@@ -1,139 +1,144 @@
 import { computed, ref } from 'vue'
 
 type NormalObject = Record<string, any>
-interface Pagination {
-  pageSize: number
+interface OffsetPagination {
   start: number
+  pageSize: number
+}
+interface Pagination {
   page: number
+  pageSize: number
 }
 
-/**
- * 判断对象是否有某个属性
- * @param obj 对象
- * @param keys 属性名
- */
-const hasOwnProperty = (obj: NormalObject, keys: string | string[]) => {
-  if (Array.isArray(keys)) {
-    return keys.every((key) => key in obj)
-  } else {
-    return keys in obj
-  }
-}
-
-interface TableResult<T = any> {
+interface TableResult<R = any> {
   total: number
-  rows: T[]
+  rows: R[]
 }
-
-type RequestTableResult<T = any> = TableResult<T> | T
 
 interface Options<T = any> {
   params?: NormalObject
-  apiFn: (params: NormalObject, pagination?: Pagination) => Promise<RequestTableResult>
-  callback?: (data: RequestTableResult) => TableResult<T>
+  apiFn: (params: NormalObject, pagination?: Pagination | OffsetPagination) => Promise<TableResult>
+  onFormat?: (data: T[]) => T[]
   onSuccess?: () => void
-  onFail?: () => void
-  isPageable?: boolean
+  onFail?: (error?: unknown) => void
+  pageable?: boolean
+  useOffsetPagination?: boolean
   immediate?: boolean
 }
 
-
 /**
- * 快开通用表格逻辑
+ * 通用表格逻辑
+ * @description table 页面操作方法封装
  * @param options
  */
-export default function useTable<T extends NormalObject = NormalObject> (options: Options) {
+export default function useTable<T extends NormalObject = NormalObject>(options: Options) {
+  type Table = TableResult<T>
+
+  const { params, apiFn, onFormat, onSuccess, onFail, pageable, useOffsetPagination, immediate } = options
+
   const loading = ref(false)
   const tableData = ref<T[]>([])
   const total = ref(0)
   const pagination = ref<Pagination>({
-    start: 1,
     page: 1,
     pageSize: 10,
   })
-  const paramsInit = JSON.parse(JSON.stringify(options.params || {}))
+  const initialParams = JSON.parse(JSON.stringify(params || {}))
 
   // 接口请求相关--start
-  const _isPageable = computed(() => options.isPageable ?? true)
+  const isPageable = pageable ?? true
+  const isUseOffsetPagination = useOffsetPagination ?? true
+  const isImmediate = immediate ?? true
 
-  /**
-   * 处理接口返回数据
-   */
-  const handleApiResponse = (res: RequestTableResult) => {
-    options.callback && (res = options.callback(res))
-    if (!hasOwnProperty(res, ['rows', 'total'])) {
-      throw new Error('接口返回格式不正确')
+  // 分页参数
+  const computedPagination = computed(() => {
+    const { page, pageSize } = pagination.value
+    const offsetPagination = {
+      start: (page - 1) * pageSize,
+      pageSize
     }
-    return res
-  }
+    if (!isPageable) return void 0
+    if (isUseOffsetPagination) return offsetPagination
+    else return { page, pageSize }
+  })
 
   /**
    * 处理分页
    */
-  const handlePagination = async (res: RequestTableResult) => {
-    const handleData = (res: any) => {
-      if (_isPageable.value) {
-        tableData.value = res.rows
-        total.value = res.total
-      } else {
-        tableData.value = res
-        total.value = res.length
-      }
-      options.onSuccess && options.onSuccess()
-    }
+  const handlePagination = async(res: Table) => {
+    const { page, pageSize } = pagination.value
+    const totalPage = Math.ceil(total.value / pageSize)
+    const limitFlag = totalPage > pageSize
 
-    // 如果是分页，且当前页没有数据，且当前页不是第一页，且总页数大于当前页，那么请求最后一页
-    if (_isPageable.value && res.rows.length === 0 && pagination.value.page > 1) {
-      const totalPages = total.value % pagination.value.page
-        ? Math.ceil(total.value / pagination.value.pageSize)
-        : total.value / pagination.value.pageSize
-
-      if (totalPages > pagination.value.page) {
-        pagination.value.page = totalPages
-        await getList()
-      }
+    // 如果是分页，且当前页没有数据，且当前页不是第一页，总页数大于当前页，那么请求最后一页
+    if (isPageable && res.rows.length === 0 && limitFlag && page > 1) {
+      pagination.value.page = totalPage
+      await getList()
     } else {
-      handleData(res)
+      tableData.value = onFormat ? onFormat(res.rows) : res.rows
+      total.value = res.total
+      onSuccess && onSuccess()
     }
   }
 
   /**
    * 获取列表
    */
-  const getList = async () => {
-    loading.value = true
+  const getList = async() => {
+    if (!apiFn) throw new Error('请传入 apiFn !')
 
     try {
-      const otherParams = options.params || {}
-      const paginationParams = _isPageable.value ? pagination.value : void 0
-      const res = await options.apiFn(otherParams, paginationParams).finally(() => (loading.value = false))
-      const processedRes = handleApiResponse(res)
-      await handlePagination(processedRes)
+      loading.value = true
+      const otherParams = params || {}
+      const res = await apiFn(otherParams, computedPagination.value)
+      if (!res || typeof res.total !== 'number' || !Array.isArray(res.rows)) {
+        throw new Error('Invalid response from api function')
+      }
+      await handlePagination(res)
     } catch (error) {
-      // 处理其他错误，例如网络请求失败等
-      options.onFail && options.onFail()
+      onFail && onFail(error)
+      // eslint-disable-next-line no-console
+      console.error('Failed to fetch data:', error)
+    } finally {
+      loading.value = false
     }
   }
   // 接口请求相关--end
 
+  /**
+   * 每页条数改变
+   */
   const handlePageSizeChange = (pageSize: number) => {
-    pagination.value = { ...pagination.value, page: 1, pageSize }
+    pagination.value = {
+      page: 1,
+      pageSize
+    }
     getList()
   }
 
+  /**
+   * 当前页改变
+   */
   const handleCurrentChange = (page: number) => {
-    pagination.value = { ...pagination.value, page }
+    pagination.value.page = page
     getList()
   }
 
-  const resetParams = () => {
-    Object.keys(paramsInit).forEach(item => {
-      options.params![item] = paramsInit[item]
+  /**
+   * 重置参数
+   */
+  const resetParams = (reload: boolean = true) => {
+    pagination.value.page = 1
+    Object.keys(initialParams).forEach(item => {
+      params![item] = initialParams[item]
     })
-    getList()
+    if (reload) {
+      getList()
+    }
   }
 
-  if (options.immediate ?? true) getList()
+  // 立即请求
+  isImmediate && getList()
 
   return {
     tableData,
